@@ -6,16 +6,17 @@ import sys
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
 import xml.dom.minidom
+import glob
 
 from tf.transformations import *
 
 from naming import *
 from conversions import *
 
-models_paths = [os.path.expanduser('~/.gazebo/models/')];
+models_paths = [os.path.expanduser('~/.gazebo/models/')]
 
 if 'GAZEBO_MODEL_PATH' in os.environ:
-  model_path_env = os.environ['GAZEBO_MODEL_PATH'].split(':');
+  model_path_env = os.environ['GAZEBO_MODEL_PATH'].split(':')
   models_paths = models_paths + model_path_env
 
 mesh_path_env_name='MESH_WORKSPACE_PATH'
@@ -52,7 +53,9 @@ def find_mesh_in_catkin_ws(filename):
               break
           catkin_stack_path = partial_path.replace(path_part + '/', '')
           filename_path = os.path.join(root, currfile).replace(catkin_stack_path, '')
+          #print('Adding %s to mesh cache (catkin_stack_path=%s)' % (filename_path, catkin_stack_path))
           find_mesh_in_catkin_ws.cache.append(filename_path)
+    #print(find_mesh_in_catkin_ws.cache)
   matching = [path for path in find_mesh_in_catkin_ws.cache if filename in path]
   return ' OR '.join(matching)
 
@@ -73,9 +76,8 @@ def find_model_in_gazebo_dir(modelname):
           filename_path = os.path.join(dirpath, currfile)
           try:
             tree = ET.parse(filename_path)
-          except ParseError, e:
-              print("Error parsing SDF file %s" % filename_path)
-              print(e)
+          except ParseError as e:
+              print("Error parsing SDF file %s (%s). Ignoring model and continuing." % (filename_path, e))
               continue
           root = tree.getroot()
           if root.tag != 'sdf':
@@ -85,9 +87,17 @@ def find_model_in_gazebo_dir(modelname):
             continue
           modelname_in_file = modelnode.attrib['name']
           if modelname_in_file not in find_model_in_gazebo_dir.cache:
+            #print('Adding (name=%s, path=%s) to model cache' % (modelname_in_file, filename_path))
             find_model_in_gazebo_dir.cache[modelname_in_file] = filename_path
-  #print(find_model_in_gazebo_dir.cache)
-  return find_model_in_gazebo_dir.cache.get(modelname)
+    #print(find_model_in_gazebo_dir.cache)
+  if '/' in modelname:  # path-based
+    for models_path in models_paths + ['.']:
+      modelfile_paths = glob.glob(os.path.join(models_path, modelname, '*.sdf'))
+      for modelfile_path in modelfile_paths:
+        if os.path.exists(modelfile_path):
+          return modelfile_path
+  else:  # name-based
+    return find_model_in_gazebo_dir.cache.get(modelname)
 find_model_in_gazebo_dir.cache = {}
 
 
@@ -127,6 +137,9 @@ def model_from_include(parent, include_node):
     submodel_uri = get_tag(include_node, 'uri')
     submodel_uri = submodel_uri.replace('model://', '')
     submodel_path = find_model_in_gazebo_dir(submodel_uri)
+    if not submodel_path:
+      print('Failed to find included model (URI: %s)' % submodel_uri)
+      return
     submodel_name = get_tag(include_node, 'name')
     submodel_pose = get_tag_pose(include_node)
     return Model(parent, name=submodel_name, pose=submodel_pose, file=submodel_path)
@@ -188,8 +201,12 @@ class World(object):
     self.version = kwargs.get('version', self.version)
     if node.findall('world'):
       node = node.findall('world')[0]
-      for include_node in node.iter('include'):
-        self.models.append(model_from_include(None, include_node))
+      for include_node in node.findall('include'):
+        included_model = model_from_include(None, include_node)
+        if not included_model:
+          print('Failed to include model, see previous errors. Aborting.')
+          sys.exit(1)
+        self.models.append(included_model)
       # TODO lights
     self.models += [Model(tree=model_node, version=self.version) for model_node in node.findall('model')]
 
@@ -327,11 +344,15 @@ class Model(SpatialEntity):
       return
     self.version = kwargs.get('version', self.version)
     super(Model, self).from_tree(node, **kwargs)
-    self.links = [Link(self, tree=link_node) for link_node in node.iter('link')]
-    self.joints = [Joint(self, tree=joint_node) for joint_node in node.iter('joint')]
+    self.links = [Link(self, tree=link_node) for link_node in node.findall('link')]
+    self.joints = [Joint(self, tree=joint_node) for joint_node in node.findall('joint')]
 
-    for include_node in node.iter('include'):
-      self.submodels.append(model_from_include(self, include_node))
+    for include_node in node.findall('include'):
+      included_submodel = model_from_include(self, include_node)
+      if not included_submodel:
+        print('Failed to include model, see previous errors. Aborting.')
+        sys.exit(1)
+      self.submodels.append(included_submodel)
 
 
   def add_urdf_elements(self, node, prefix = ''):
@@ -535,8 +556,8 @@ class Link(SpatialEntity):
       return
     super(Link, self).from_tree(node)
     self.inertial = Inertial(tree=get_node(node, 'inertial'))
-    self.collisions = [Collision(tree=collision_node) for collision_node in node.iter('collision')]
-    self.visuals = [Visual(tree=visual_node) for visual_node in node.iter('visual')]
+    self.collisions = [Collision(tree=collision_node) for collision_node in node.findall('collision')]
+    self.visuals = [Visual(tree=visual_node) for visual_node in node.findall('visual')]
 
   def is_empty(self):
     return len(self.visuals) == 0 and len(self.collisions) == 0
@@ -570,6 +591,7 @@ class Joint(SpatialEntity):
     super(Joint, self).__init__(**kwargs)
     self.parent_model = parent_model
     self.type = ''
+    self.urdf_type = ''
     self.parent = ''
     self.child = ''
     self.axis = Axis(self)
@@ -585,6 +607,7 @@ class Joint(SpatialEntity):
       'Joint(\n',
       '  %s\n' % indent(super(Joint, self).__repr__(), 2),
       '  type: %s\n' % self.type,
+      '  urdf_type: %s\n' % self.urdf_type,
       '  parent: %s\n' % self.parent,
       '  child: %s\n' % self.child,
       '  axis: %s\n' % self.axis,
@@ -601,6 +624,7 @@ class Joint(SpatialEntity):
       return
     super(Joint, self).from_tree(node)
     self.type = node.attrib['type']
+    self.urdf_type = self.type
     self.parent = get_tag(node, 'parent', '')
     self.child = get_tag(node, 'child', '')
     self.axis = Axis(self, tree=get_node(node, 'axis'))
@@ -620,10 +644,12 @@ class Joint(SpatialEntity):
     else: # joint crosses includes
       pose2origin(jointnode, concatenate_matrices(inverse_matrix(parent_pose_world), self.tree_child_link.pose_world))
     if self.type == 'revolute' and self.axis.lower_limit == 0 and self.axis.upper_limit == 0:
-      jointnode.attrib['type'] = 'fixed'
+      self.urdf_type = 'fixed'
+      jointnode.attrib['type'] = self.urdf_type
     elif self.type == 'universal':
       # Simulate universal robot as
       # self.parent -> revolute joint (self) -> dummy link -> revolute joint -> self.child
+      self.urdf_type = 'revolute-hack'
       jointnode.attrib['type'] = 'revolute'
       dummylinknode = ET.SubElement(node, 'link', {'name': sdf2tfname(full_prefix + self.name + '::revolute_dummy_link')})
       childnode.attrib['link'] = dummylinknode.attrib['name']
@@ -686,10 +712,15 @@ class Axis(object):
     if (self.version <= 1.4) or (self.version >= 1.5 and self.use_parent_model_frame): # SDF 1.4 axis is specified in model frame
       rotation_modelCBTjoint = rotation_only(modelCBTjoint)
       xyz_joint = homogeneous_times_vector(rotation_modelCBTjoint, self.xyz)
-      xyz_joint /= numpy.linalg.norm(xyz_joint)
+      xyz_norm = numpy.linalg.norm(xyz_joint)
+      if xyz_norm != 0.0:
+        xyz_joint /= xyz_norm
+      elif self.joint.urdf_type == 'fixed':
+        pass
+      else:
+        print('Error calculating axis of joint %s for given xyz=%s' % (self.joint.name, xyz_joint))
       #print('self.xyz=%s\nmodelCBTjoint:\n%s\nrotation_modelCBT_joint:\n%s\nxyz_joint=%s' % (self.xyz, modelCBTjoint, rotation_modelCBTjoint, xyz_joint))
     else: # SDF 1.5 axis is specified in joint frame unless the use_parent_model_frame flag is set to true
-      print('UNTESTED')
       xyz_joint = self.xyz
     axisnode = ET.SubElement(node, 'axis', {'xyz': array2string(rounded(xyz_joint))})
     limitnode = ET.SubElement(node, 'limit', {'lower': str(self.lower_limit), 'upper': str(self.upper_limit), 'effort': str(self.effort_limit), 'velocity': str(self.velocity_limit)})
@@ -729,7 +760,7 @@ class Inertial(object):
   def add_urdf_elements(self, node, link_pose):
     inertialnode = ET.SubElement(node, 'inertial')
     massnode = ET.SubElement(inertialnode, 'mass', {'value': str(self.mass)})
-    pose2origin(inertialnode, concatenate_matrices(link_pose, self.pose))
+    pose2origin(inertialnode, self.pose)  # inertial reference frame is relative to the link reference frame in URDF and SDF
     self.inertia.add_urdf_elements(inertialnode)
 
 
