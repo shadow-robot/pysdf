@@ -24,7 +24,7 @@ if mesh_path_env_name in os.environ:
   catkin_ws_path = os.environ[mesh_path_env_name]
 else:
   catkin_ws_path = os.path.expanduser('~') + '/catkin_ws/src/'
-supported_sdf_versions = [1.4, 1.5, 1.6]
+supported_sdf_versions = [1.4, 1.5, 1.6, 1.7]
 
 catkin_ws_path_exists = os.path.exists(catkin_ws_path)
 
@@ -63,8 +63,18 @@ find_mesh_in_catkin_ws.cache = []
 
 
 def find_model_in_gazebo_dir(modelname):
+  if '/' in modelname:  # path-based
+    for models_path in models_paths + ['.']:
+      modelfile_paths = glob.glob(os.path.join(models_path, modelname, '*.sdf'))
+      for modelfile_path in modelfile_paths:
+        if os.path.exists(modelfile_path):
+          return modelfile_path
+    return None
   canonical_sdf_name = 'model.sdf'
-  if not find_model_in_gazebo_dir.cache:
+  # Otherwise, name-based:
+  # If the cache has not been built yet, or the requested model is not in the cache (and it might
+  # need updating), then (re)build the cache
+  if not find_model_in_gazebo_dir.cache or modelname not in find_model_in_gazebo_dir.cache:
     for models_path in models_paths:
       for dirpath, dirs, files in os.walk(models_path, followlinks=True):
         if canonical_sdf_name in files:
@@ -90,14 +100,7 @@ def find_model_in_gazebo_dir(modelname):
             #print('Adding (name=%s, path=%s) to model cache' % (modelname_in_file, filename_path))
             find_model_in_gazebo_dir.cache[modelname_in_file] = filename_path
     #print(find_model_in_gazebo_dir.cache)
-  if '/' in modelname:  # path-based
-    for models_path in models_paths + ['.']:
-      modelfile_paths = glob.glob(os.path.join(models_path, modelname, '*.sdf'))
-      for modelfile_path in modelfile_paths:
-        if os.path.exists(modelfile_path):
-          return modelfile_path
-  else:  # name-based
-    return find_model_in_gazebo_dir.cache.get(modelname)
+  return find_model_in_gazebo_dir.cache.get(modelname)
 find_model_in_gazebo_dir.cache = {}
 
 
