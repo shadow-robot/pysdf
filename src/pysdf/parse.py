@@ -24,7 +24,7 @@ if mesh_path_env_name in os.environ:
   catkin_ws_path = os.environ[mesh_path_env_name]
 else:
   catkin_ws_path = os.path.expanduser('~') + '/catkin_ws/src/'
-supported_sdf_versions = [1.4, 1.5, 1.6]
+supported_sdf_versions = [1.4, 1.5, 1.6, 1.7]
 
 catkin_ws_path_exists = os.path.exists(catkin_ws_path)
 
